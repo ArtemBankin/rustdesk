@@ -222,7 +222,7 @@ jobs:
       - name: Prepare Quick Support artifact
         shell: powershell
         run: |
-          Rename-Item ./fastdesk/rustdesk.exe fastdesk-qs.exe
+          Copy-Item ./fastdesk/rustdesk.exe ./fastdesk/fastdesk-qs.exe -Force
           @(
             'Fastdesk experimental Windows x64 hardware-accelerated build.',
             'Run fastdesk-qs.exe.',
