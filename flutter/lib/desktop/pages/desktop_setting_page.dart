@@ -420,6 +420,7 @@ class _GeneralState extends State<_General> {
         _Card(title: 'Language', children: [language()]),
         if (!isWeb) hwcodec(),
         if (!isWeb) audio(context),
+        if (!isWeb) audioBitrate(),
         if (!isWeb) record(context),
         if (!isWeb) WaylandCard(),
         other()
@@ -504,6 +505,14 @@ class _GeneralState extends State<_General> {
         ),
       if (!isWeb && !outgoingOnly)
         _OptionCheckBox(context, 'Adaptive bitrate', kOptionEnableAbr),
+      if (!isWeb && !outgoingOnly)
+        _OptionCheckBox(
+          context,
+          'Fastdesk fixed 60 FPS',
+          kOptionFastdeskFixed60Fps,
+          optGetter: () =>
+              bind.mainGetOptionSync(key: kOptionFastdeskFixed60Fps) != 'N',
+        ),
       if (!isWeb) wallpaper(),
       if (!isWeb && !incomingOnly) ...[
         _OptionCheckBox(
@@ -732,6 +741,33 @@ class _GeneralState extends State<_General> {
     }
 
     return AudioInput(builder: builder, isCm: false, isVoiceCall: false);
+  }
+
+  Widget audioBitrate() {
+    if (bind.isOutgoingOnly()) {
+      return const Offstage();
+    }
+
+    const bitrates = ['64', '96', '128', '192', '256'];
+    var current = bind.mainGetOptionSync(key: kOptionAudioBitrateKbps);
+    if (!bitrates.contains(current)) {
+      current = '128';
+    }
+
+    final child = ComboBox(
+      keys: bitrates,
+      values: bitrates.map((value) => '$value kbps').toList(),
+      initialKey: current,
+      onChanged: (key) async {
+        await bind.mainSetOption(key: kOptionAudioBitrateKbps, value: key);
+        setState(() {});
+      },
+    ).marginOnly(left: _kContentHMargin);
+
+    return _Card(
+      title: 'Audio bitrate',
+      children: [child],
+    );
   }
 
   Widget record(BuildContext context) {

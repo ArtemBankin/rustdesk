@@ -15,6 +15,16 @@ use crate::{
 // Restart msgbox text is kept as a legacy UI fallback; Flutter handles the type as a control event.
 const RESTART_REMOTE_DEVICE_NO_DATA_TIMEOUT: Duration = Duration::from_secs(5);
 const KCP_CLOSE_REASON_FLUSH_DELAY: Duration = Duration::from_millis(30);
+const FASTDESK_FIXED_FPS: usize = 60;
+// At 60 FPS this bounds queued compressed frames to roughly 133 ms instead
+// of the upstream 120-frame queue (up to two seconds). On overflow, the
+// existing force_push/refresh path drops stale data and requests a keyframe.
+const FASTDESK_VIDEO_QUEUE_SIZE: usize = 8;
+
+fn fastdesk_fixed_60_fps_enabled() -> bool {
+    config::Config::get_option("fastdesk-fixed-60-fps") != "N"
+}
+
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::{clipboard::try_empty_clipboard_files, clipboard_file::unix_file_clip};
 #[cfg(any(
@@ -1171,6 +1181,29 @@ impl<T: InvokeUiSession> Remote<T> {
     // The controlled end can consider auto fps as the maximum decoding fps.
     #[inline]
     fn fps_control(&mut self, direct: bool, real_fps_map: HashMap<usize, i32>) {
+        if fastdesk_fixed_60_fps_enabled() {
+            let last_auto_fps = self.handler.lc.read().unwrap().last_auto_fps;
+            if last_auto_fps != Some(FASTDESK_FIXED_FPS) {
+                let mut misc = Misc::new();
+                misc.set_option(OptionMessage {
+                    custom_fps: FASTDESK_FIXED_FPS as _,
+                    ..Default::default()
+                });
+                let mut msg = Message::new();
+                msg.set_misc(misc);
+                self.sender.send(Data::Message(msg)).ok();
+                log::info!("Fastdesk fixed FPS target: {}", FASTDESK_FIXED_FPS);
+
+                let custom_fps = {
+                    let mut lc = self.handler.lc.write().unwrap();
+                    lc.last_auto_fps = Some(FASTDESK_FIXED_FPS);
+                    lc.custom_fps.clone()
+                };
+                *custom_fps.lock().unwrap() = Some(FASTDESK_FIXED_FPS);
+            }
+            return;
+        }
+
         self.video_threads.iter_mut().for_each(|(k, v)| {
             let real_fps = real_fps_map.get(k).cloned().unwrap_or_default();
             if real_fps == 0 {
@@ -2423,7 +2456,12 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     fn new_video_thread(&mut self, display: usize) {
-        let video_queue = Arc::new(RwLock::new(ArrayQueue::new(client::VIDEO_QUEUE_SIZE)));
+        let queue_size = if fastdesk_fixed_60_fps_enabled() {
+            FASTDESK_VIDEO_QUEUE_SIZE
+        } else {
+            client::VIDEO_QUEUE_SIZE
+        };
+        let video_queue = Arc::new(RwLock::new(ArrayQueue::new(queue_size)));
         let (video_sender, video_receiver) = std::sync::mpsc::channel::<MediaData>();
         let decode_fps = Arc::new(RwLock::new(None));
         let frame_count = Arc::new(RwLock::new(0));

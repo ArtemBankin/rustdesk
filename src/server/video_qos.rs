@@ -32,6 +32,12 @@ pub const FPS: u32 = 30;
 pub const MIN_FPS: u32 = 1;
 pub const MAX_FPS: u32 = 120;
 pub const INIT_FPS: u32 = 15;
+pub const FASTDESK_FIXED_FPS: u32 = 60;
+
+#[inline]
+fn fastdesk_fixed_60_fps_enabled() -> bool {
+    Config::get_option("fastdesk-fixed-60-fps") != "N"
+}
 
 // Bitrate ratio constants for different quality levels
 const BR_MAX: f32 = 40.0; // 2000 * 2 / 100
@@ -116,7 +122,11 @@ pub struct VideoQoS {
 impl Default for VideoQoS {
     fn default() -> Self {
         VideoQoS {
-            fps: FPS,
+            fps: if fastdesk_fixed_60_fps_enabled() {
+                FASTDESK_FIXED_FPS
+            } else {
+                FPS
+            },
             ratio: BR_BALANCED,
             users: Default::default(),
             displays: Default::default(),
@@ -207,6 +217,9 @@ impl VideoQoS {
     }
 
     pub fn user_auto_adjust_fps(&mut self, id: i32, fps: u32) {
+        if fastdesk_fixed_60_fps_enabled() {
+            return;
+        }
         if fps < MIN_FPS || fps > MAX_FPS {
             return;
         }
@@ -244,6 +257,22 @@ impl VideoQoS {
     }
 
     pub fn user_network_delay(&mut self, id: i32, delay: u32) {
+        if fastdesk_fixed_60_fps_enabled() {
+            let mut adjust_ratio = false;
+            if let Some(user) = self.users.get_mut(&id) {
+                user.delay.add_delay(delay.max(10));
+                adjust_ratio = user.delay.fps.is_none();
+                user.delay.fps = Some(FASTDESK_FIXED_FPS);
+            }
+            self.fps = FASTDESK_FIXED_FPS;
+            if adjust_ratio && !cfg!(target_os = "linux") {
+                // Keep bitrate adaptation active. Fastdesk removes adaptive
+                // FPS only, so congestion is handled by video quality.
+                self.adjust_ratio(false);
+            }
+            return;
+        }
+
         let highest_fps = self.highest_fps();
         let target_ratio = self.latest_quality().ratio();
 
@@ -379,6 +408,10 @@ impl VideoQoS {
 
     #[inline]
     fn highest_fps(&self) -> u32 {
+        if fastdesk_fixed_60_fps_enabled() {
+            return FASTDESK_FIXED_FPS;
+        }
+
         let user_fps = |u: &UserData| {
             let mut fps = u.custom_fps.unwrap_or(FPS);
             if let Some(auto_adjust_fps) = u.auto_adjust_fps {
@@ -509,6 +542,11 @@ impl VideoQoS {
 
     // Adjust fps based on network delay and user response time
     fn adjust_fps(&mut self) {
+        if fastdesk_fixed_60_fps_enabled() {
+            self.fps = FASTDESK_FIXED_FPS;
+            return;
+        }
+
         let highest_fps = self.highest_fps();
         // Get minimum fps from all users
         let mut fps = self

@@ -488,7 +488,12 @@ impl<T: InvokeUiSession> Session<T> {
         if let Some(msg) = msg {
             self.send(Data::Message(msg));
         }
-        if value != "custom" {
+        if Config::get_option("fastdesk-fixed-60-fps") != "N" {
+            // Upstream resets non-custom quality modes to 30 FPS. Fastdesk
+            // keeps the 60 FPS target across quality changes.
+            let msg = self.lc.write().unwrap().set_custom_fps(60, false);
+            self.send(Data::Message(msg));
+        } else if value != "custom" {
             let last_auto_fps = self.lc.read().unwrap().last_auto_fps;
             if last_auto_fps.unwrap_or(usize::MAX) >= 30 {
                 // non custom quality use 30 fps

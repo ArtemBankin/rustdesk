@@ -15,12 +15,30 @@
 use super::*;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use hbb_common::anyhow::anyhow;
-use magnum_opus::{Application::*, Channels::*, Encoder};
+use magnum_opus::{Application::*, Bitrate, Channels::*, Encoder};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NAME: &'static str = "audio";
 pub const AUDIO_DATA_SIZE_U8: usize = 960 * 4; // 10ms in 48000 stereo
+const DEFAULT_AUDIO_BITRATE_KBPS: i32 = 128;
+const AUDIO_BITRATE_CHOICES_KBPS: [i32; 5] = [64, 96, 128, 192, 256];
 static RESTARTING: AtomicBool = AtomicBool::new(false);
+
+fn configured_audio_bitrate_bps() -> i32 {
+    Config::get_option("audio-bitrate-kbps")
+        .parse::<i32>()
+        .ok()
+        .filter(|value| AUDIO_BITRATE_CHOICES_KBPS.contains(value))
+        .unwrap_or(DEFAULT_AUDIO_BITRATE_KBPS)
+        * 1_000
+}
+
+fn configure_encoder_bitrate(encoder: &mut Encoder) -> ResultType<()> {
+    let bitrate = configured_audio_bitrate_bps();
+    encoder.set_bitrate(Bitrate::Bits(bitrate))?;
+    log::info!("Opus audio bitrate: {} kbps", bitrate / 1_000);
+    Ok(())
+}
 
 lazy_static::lazy_static! {
     static ref VOICE_CALL_INPUT_DEVICE: Arc::<Mutex::<Option<String>>> = Default::default();
@@ -101,6 +119,7 @@ mod pa_impl {
             AUDIO_ZERO_COUNT = 0;
         }
         let mut encoder = Encoder::new(crate::platform::PA_SAMPLE_RATE, Stereo, LowDelay)?;
+        configure_encoder_bitrate(&mut encoder)?;
         #[cfg(target_os = "linux")]
         allow_err!(
             stream
@@ -405,6 +424,7 @@ mod cpal_impl {
         }
         let device_channel = config.channels();
         let mut encoder = Encoder::new(sample_rate, encode_channel, LowDelay)?;
+        configure_encoder_bitrate(&mut encoder)?;
         // https://www.opus-codec.org/docs/html_api/group__opusencoder.html#gace941e4ef26ed844879fde342ffbe546
         // https://chromium.googlesource.com/chromium/deps/opus/+/1.1.1/include/opus.h
         // Do not set `frame_size = sample_rate as usize / 100;`
