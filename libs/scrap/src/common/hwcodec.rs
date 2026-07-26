@@ -27,6 +27,17 @@ use hwcodec::{
 
 const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
 pub const DEFAULT_FPS: i32 = 30;
+const FASTDESK_FIXED_FPS: i32 = 60;
+
+#[inline]
+pub fn encoder_fps() -> i32 {
+    if hbb_common::config::Config::get_option("fastdesk-fixed-60-fps") != "N" {
+        FASTDESK_FIXED_FPS
+    } else {
+        DEFAULT_FPS
+    }
+}
+
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
 pub const ERR_HEVC_POC: i32 = HwcodecErrno::HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC as i32;
@@ -77,7 +88,7 @@ impl EncoderApi for HwRamEncoder {
                     pixfmt: DEFAULT_PIXFMT,
                     align: HW_STRIDE_ALIGN as _,
                     kbs: bitrate as i32,
-                    fps: DEFAULT_FPS,
+                    fps: encoder_fps(),
                     gop,
                     quality: DEFAULT_HW_QUALITY,
                     rc,
