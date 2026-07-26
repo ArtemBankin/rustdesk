@@ -848,10 +848,18 @@ async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
     loop {
+        // `stop-service` belongs to the installed Windows service. A Quick
+        // Support / portable executable shares the same RustDesk config file,
+        // so inheriting that flag would silently disable its own direct-IP
+        // listener whenever the installed service had been stopped. Respect
+        // the flag only for the installed executable; portable Fastdesk must
+        // remain able to host direct Tailscale connections on port 21118.
+        let installed_service_stopped = crate::platform::is_installed()
+            && option2bool("stop-service", &Config::get_option("stop-service"));
         let disabled = !option2bool(
             OPTION_DIRECT_SERVER,
             &Config::get_option(OPTION_DIRECT_SERVER),
-        ) || option2bool("stop-service", &Config::get_option("stop-service"));
+        ) || installed_service_stopped;
         if !disabled && listener.is_none() {
             port = get_direct_port();
             match hbb_common::tcp::listen_any(port as _).await {
