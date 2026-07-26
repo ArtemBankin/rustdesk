@@ -847,14 +847,19 @@ fn get_direct_port() -> i32 {
 async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
+    #[cfg(windows)]
+    let quick_support_exe = std::env::current_exe()
+        .ok()
+        .map(|exe| crate::core_main::is_quick_support_exe(&exe.to_string_lossy()))
+        .unwrap_or(false);
+    #[cfg(not(windows))]
+    let quick_support_exe = false;
     loop {
-        // `stop-service` belongs to the installed Windows service. A Quick
-        // Support / portable executable shares the same RustDesk config file,
-        // so inheriting that flag would silently disable its own direct-IP
-        // listener whenever the installed service had been stopped. Respect
-        // the flag only for the installed executable; portable Fastdesk must
-        // remain able to host direct Tailscale connections on port 21118.
-        let installed_service_stopped = crate::platform::is_installed()
+        // `stop-service` belongs to the installed Windows service. Quick
+        // Support can coexist with that installation and shares its config,
+        // but must still host direct-IP connections from its own process.
+        let installed_service_stopped = !quick_support_exe
+            && crate::platform::is_installed()
             && option2bool("stop-service", &Config::get_option("stop-service"));
         let disabled = !option2bool(
             OPTION_DIRECT_SERVER,
