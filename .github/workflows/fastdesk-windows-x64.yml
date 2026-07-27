@@ -1,4 +1,4 @@
-name: Fastdesk Windows x64 HW60
+name: Fastdesk Windows x64 Portable HW60
 
 on:
   workflow_dispatch:
@@ -20,7 +20,9 @@ env:
   FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
 
 jobs:
+  # Code generation only. This job does not build or package Linux/Android binaries.
   generate-bridge:
+    name: Generate Flutter bindings only
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source
@@ -186,10 +188,14 @@ jobs:
             exit 1
           fi
 
-      - name: Build Fastdesk x64 with hardware codec and VRAM
+      - name: Build Fastdesk Windows x64 portable with hardware codec and VRAM
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
           Move-Item ./flutter/build/windows/x64/runner/Release ./fastdesk
 
       - name: Add optional drivers

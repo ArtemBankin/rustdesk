@@ -1,4 +1,6 @@
 use std::{io, mem, ptr, slice};
+use hbb_common::log;
+
 pub mod gdi;
 pub use gdi::CapturerGDI;
 pub mod mag;
