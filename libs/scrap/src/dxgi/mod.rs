@@ -49,6 +49,11 @@ pub struct Capturer {
     fastlane: bool,
     surface: ComPtr<IDXGISurface>,
     texture: ComPtr<ID3D11Texture2D>,
+    repeat_texture: ComPtr<ID3D11Texture2D>,
+    repeat_texture_valid: bool,
+    repeat_texture_rotation: usize,
+    repeat_texture_failed: bool,
+    repeat_last_frame: bool,
     width: usize,
     height: usize,
     rotated: Vec<u8>,
@@ -164,6 +169,11 @@ impl Capturer {
             fastlane: desc.DesktopImageInSystemMemory == TRUE,
             surface: ComPtr(ptr::null_mut()),
             texture: ComPtr(ptr::null_mut()),
+            repeat_texture: ComPtr(ptr::null_mut()),
+            repeat_texture_valid: false,
+            repeat_texture_rotation: 0,
+            repeat_texture_failed: false,
+            repeat_last_frame: false,
             width: display.width() as usize,
             height: display.height() as usize,
             display,
@@ -327,6 +337,50 @@ impl Capturer {
     #[cfg(feature = "vram")]
     pub fn set_output_texture(&mut self, texture: bool) {
         self.output_texture = texture;
+        self.repeat_last_frame = texture
+            && hbb_common::config::Config::get_option("fastdesk-fixed-60-fps") != "N";
+        if !self.repeat_last_frame {
+            self.repeat_texture = ComPtr(ptr::null_mut());
+            self.repeat_texture_valid = false;
+            self.repeat_texture_rotation = 0;
+            self.repeat_texture_failed = false;
+        }
+    }
+
+    unsafe fn cache_repeat_texture(
+        &mut self,
+        source: *mut ID3D11Texture2D,
+        rotation: usize,
+    ) {
+        if !self.repeat_last_frame || source.is_null() || self.repeat_texture_failed {
+            return;
+        }
+
+        if self.repeat_texture.is_null() {
+            let mut desc: D3D11_TEXTURE2D_DESC = mem::zeroed();
+            (*source).GetDesc(&mut desc);
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+            let mut texture = ptr::null_mut();
+            if let Err(err) = wrap_hresult((*self.device.0).CreateTexture2D(
+                &desc,
+                ptr::null(),
+                &mut texture,
+            )) {
+                self.repeat_texture_failed = true;
+                log::warn!("Failed to create Fastdesk repeat texture: {err}");
+                return;
+            }
+            self.repeat_texture = ComPtr(texture);
+        }
+
+        (*self.context.0).CopyResource(
+            self.repeat_texture.0 as *mut _,
+            source as *mut _,
+        );
+        self.repeat_texture_rotation = rotation;
+        self.repeat_texture_valid = true;
     }
 
     unsafe fn load_frame(&mut self, timeout: UINT) -> io::Result<(*const u8, i32)> {
@@ -392,7 +446,12 @@ impl Capturer {
 
     pub fn frame<'a>(&'a mut self, timeout: UINT) -> io::Result<Frame<'a>> {
         if self.output_texture {
-            Ok(Frame::Texture(self.get_texture(timeout)?))
+            let (texture, repeated) = self.get_texture(timeout)?;
+            if repeated {
+                Ok(Frame::RepeatedTexture(texture))
+            } else {
+                Ok(Frame::Texture(texture))
+            }
         } else {
             let width = self.width;
             let height = self.height;
@@ -467,7 +526,7 @@ impl Capturer {
         }
     }
 
-    fn get_texture(&mut self, timeout: UINT) -> io::Result<(*mut c_void, usize)> {
+    fn get_texture(&mut self, timeout: UINT) -> io::Result<((*mut c_void, usize), bool)> {
         unsafe {
             if self.duplication.0.is_null() {
                 return Err(std::io::ErrorKind::AddrNotAvailable.into());
@@ -477,10 +536,32 @@ impl Capturer {
             #[allow(invalid_value)]
             let mut info = mem::MaybeUninit::uninit().assume_init();
 
-            wrap_hresult((*self.duplication.0).AcquireNextFrame(timeout, &mut info, &mut frame))?;
+            let hres = (*self.duplication.0).AcquireNextFrame(timeout, &mut info, &mut frame);
+            if hres == DXGI_ERROR_WAIT_TIMEOUT
+                && self.repeat_last_frame
+                && self.repeat_texture_valid
+            {
+                return Ok((
+                    (
+                        self.repeat_texture.0 as *mut c_void,
+                        self.repeat_texture_rotation,
+                    ),
+                    true,
+                ));
+            }
+            wrap_hresult(hres)?;
             let frame = ComPtr(frame);
 
             if info.AccumulatedFrames == 0 || *info.LastPresentTime.QuadPart() == 0 {
+                if self.repeat_last_frame && self.repeat_texture_valid {
+                    return Ok((
+                        (
+                            self.repeat_texture.0 as *mut c_void,
+                            self.repeat_texture_rotation,
+                        ),
+                        true,
+                    ));
+                }
                 return Err(std::io::ErrorKind::WouldBlock.into());
             }
 
@@ -570,7 +651,8 @@ impl Capturer {
                     }
                 }
             }
-            Ok((final_texture, rotation))
+            self.cache_repeat_texture(final_texture as *mut ID3D11Texture2D, rotation);
+            Ok(((final_texture, rotation), false))
         }
     }
 

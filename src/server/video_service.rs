@@ -62,6 +62,11 @@ use std::{
 
 pub const OPTION_REFRESH: &'static str = "refresh";
 
+#[inline]
+fn fastdesk_fixed_60_fps_enabled() -> bool {
+    Config::get_option("fastdesk-fixed-60-fps") != "N"
+}
+
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
 
@@ -652,6 +657,9 @@ fn run(vs: VideoService) -> ResultType<()> {
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
+    let mut fixed_repeat_active =
+        vs.source.is_monitor() && fastdesk_fixed_60_fps_enabled();
+    let mut fixed_repeat_fail_counter = 0usize;
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
@@ -724,7 +732,8 @@ fn run(vs: VideoService) -> ResultType<()> {
         let res = match c.frame(spf) {
             Ok(frame) => {
                 repeat_encode_counter = 0;
-                if frame.valid() {
+                if frame.valid() && (fixed_repeat_active || !frame.is_repeat()) {
+                    let is_repeat = frame.is_repeat();
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {
@@ -741,7 +750,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                                     (format!("Convert pixfmt: {}", serr), 0, 0, vec![])
                                 }
                             },
-                            scrap::Frame::Texture(_) => {
+                            scrap::Frame::Texture(_) | scrap::Frame::RepeatedTexture(_) => {
                                 if restore_vram {
                                     // Already set one time, just ignore to break infinite loop.
                                     // Though it's unreachable, this branch is kept to avoid infinite loop.
@@ -773,7 +782,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                    let send_conn_ids = handle_one_frame(
+                    let outcome = handle_one_frame(
                         display_idx,
                         &sp,
                         frame,
@@ -785,8 +794,25 @@ fn run(vs: VideoService) -> ResultType<()> {
                         capture_width,
                         capture_height,
                     )?;
-                    frame_controller.set_send(now, send_conn_ids);
-                    send_counter += 1;
+                    if is_repeat {
+                        if outcome.encoded {
+                            fixed_repeat_fail_counter = 0;
+                        } else {
+                            fixed_repeat_fail_counter += 1;
+                            if fixed_repeat_fail_counter >= 3 {
+                                fixed_repeat_active = false;
+                                log::warn!(
+                                    "Fastdesk repeated-frame encoding failed 3 times; continuing without repeats"
+                                );
+                            }
+                        }
+                    }
+                    if outcome.encoded {
+                        frame_controller.set_send(now, outcome.send_conn_ids);
+                        if !is_repeat {
+                            send_counter += 1;
+                        }
+                    }
                 }
                 #[cfg(windows)]
                 {
@@ -828,24 +854,50 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
                 }
-                if !encoder.latency_free() && yuv.len() > 0 {
-                    // yun.len() > 0 means the frame is not texture.
-                    if repeat_encode_counter < repeat_encode_max {
+                let fixed_repeat = fixed_repeat_active && !yuv.is_empty();
+                let legacy_repeat = !fixed_repeat
+                    && !encoder.latency_free()
+                    && !yuv.is_empty()
+                    && repeat_encode_counter < repeat_encode_max;
+                if fixed_repeat || legacy_repeat {
+                    if legacy_repeat {
                         repeat_encode_counter += 1;
-                        let send_conn_ids = handle_one_frame(
-                            display_idx,
-                            &sp,
-                            EncodeInput::YUV(&yuv),
-                            ms,
-                            &mut encoder,
-                            recorder.clone(),
-                            &mut encode_fail_counter,
-                            &mut first_frame,
-                            capture_width,
-                            capture_height,
-                        )?;
-                        frame_controller.set_send(now, send_conn_ids);
-                        send_counter += 1;
+                    }
+                    let input = if fixed_repeat {
+                        EncodeInput::RepeatedYUV(&yuv)
+                    } else {
+                        EncodeInput::YUV(&yuv)
+                    };
+                    let outcome = handle_one_frame(
+                        display_idx,
+                        &sp,
+                        input,
+                        ms,
+                        &mut encoder,
+                        recorder.clone(),
+                        &mut encode_fail_counter,
+                        &mut first_frame,
+                        capture_width,
+                        capture_height,
+                    )?;
+                    if fixed_repeat {
+                        if outcome.encoded {
+                            fixed_repeat_fail_counter = 0;
+                        } else {
+                            fixed_repeat_fail_counter += 1;
+                            if fixed_repeat_fail_counter >= 3 {
+                                fixed_repeat_active = false;
+                                log::warn!(
+                                    "Fastdesk repeated-frame encoding failed 3 times; continuing without repeats"
+                                );
+                            }
+                        }
+                    }
+                    if outcome.encoded {
+                        frame_controller.set_send(now, outcome.send_conn_ids);
+                        if legacy_repeat {
+                            send_counter += 1;
+                        }
                     }
                 }
             }
@@ -1133,6 +1185,11 @@ fn check_privacy_mode_changed(
     Ok(())
 }
 
+struct FrameEncodeOutcome {
+    send_conn_ids: HashSet<i32>,
+    encoded: bool,
+}
+
 #[inline]
 fn handle_one_frame(
     display: usize,
@@ -1145,7 +1202,7 @@ fn handle_one_frame(
     first_frame: &mut bool,
     width: usize,
     height: usize,
-) -> ResultType<HashSet<i32>> {
+) -> ResultType<FrameEncodeOutcome> {
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
         if sps.has_subscribes() {
@@ -1155,7 +1212,11 @@ fn handle_one_frame(
         Ok(())
     })?;
 
-    let mut send_conn_ids: HashSet<i32> = Default::default();
+    let repeated = frame.is_repeat();
+    let mut outcome = FrameEncodeOutcome {
+        send_conn_ids: Default::default(),
+        encoded: false,
+    };
     let first = *first_frame;
     *first_frame = false;
     match encoder.encode_to_message(frame, ms) {
@@ -1169,9 +1230,15 @@ fn handle_one_frame(
                 .unwrap()
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
-            send_conn_ids = sp.send_video_frame(msg);
+            outcome.send_conn_ids = sp.send_video_frame(msg);
+            outcome.encoded = true;
         }
         Err(e) => {
+            if repeated {
+                log::debug!("Fastdesk repeated-frame encode failed: {e:?}");
+                return Ok(outcome);
+            }
+
             *encode_fail_counter += 1;
             // Encoding errors are not frequent except on Android
             if !cfg!(target_os = "android") {
@@ -1202,7 +1269,7 @@ fn handle_one_frame(
             }
         }
     }
-    Ok(send_conn_ids)
+    Ok(outcome)
 }
 
 #[inline]

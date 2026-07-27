@@ -689,7 +689,7 @@ pub mod server {
                             first_frame_captured = true;
                             dxgi_failed_times = 0;
                         }
-                        Frame::Texture(_) => {
+                        Frame::Texture(_) | Frame::RepeatedTexture(_) => {
                             // should not happen
                         }
                     },

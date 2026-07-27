@@ -176,6 +176,7 @@ pub trait TraitPixelBuffer {
 pub enum Frame<'a> {
     PixelBuffer(PixelBuffer<'a>),
     Texture((*mut c_void, usize)),
+    RepeatedTexture((*mut c_void, usize)),
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -183,8 +184,14 @@ impl Frame<'_> {
     pub fn valid<'a>(&'a self) -> bool {
         match self {
             Frame::PixelBuffer(pixelbuffer) => !pixelbuffer.data().is_empty(),
-            Frame::Texture((texture, _)) => !texture.is_null(),
+            Frame::Texture((texture, _)) | Frame::RepeatedTexture((texture, _)) => {
+                !texture.is_null()
+            }
         }
+    }
+
+    pub fn is_repeat(&self) -> bool {
+        matches!(self, Frame::RepeatedTexture(_))
     }
 
     pub fn to<'a>(
@@ -199,28 +206,38 @@ impl Frame<'_> {
                 Ok(EncodeInput::YUV(yuv))
             }
             Frame::Texture(texture) => Ok(EncodeInput::Texture(*texture)),
+            Frame::RepeatedTexture(texture) => Ok(EncodeInput::RepeatedTexture(*texture)),
         }
     }
 }
 
 pub enum EncodeInput<'a> {
     YUV(&'a [u8]),
+    RepeatedYUV(&'a [u8]),
     Texture((*mut c_void, usize)),
+    RepeatedTexture((*mut c_void, usize)),
 }
 
 impl<'a> EncodeInput<'a> {
     pub fn yuv(&self) -> ResultType<&'_ [u8]> {
         match self {
-            Self::YUV(f) => Ok(f),
+            Self::YUV(f) | Self::RepeatedYUV(f) => Ok(f),
             _ => bail!("not pixelfbuffer frame"),
         }
     }
 
     pub fn texture(&self) -> ResultType<(*mut c_void, usize)> {
         match self {
-            Self::Texture(f) => Ok(*f),
+            Self::Texture(f) | Self::RepeatedTexture(f) => Ok(*f),
             _ => bail!("not texture frame"),
         }
+    }
+
+    pub fn is_repeat(&self) -> bool {
+        matches!(
+            self,
+            Self::RepeatedYUV(_) | Self::RepeatedTexture(_)
+        )
     }
 }
 
