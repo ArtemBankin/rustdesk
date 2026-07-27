@@ -657,8 +657,15 @@ fn run(vs: VideoService) -> ResultType<()> {
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
-    let mut fixed_repeat_active =
-        vs.source.is_monitor() && fastdesk_fixed_60_fps_enabled();
+    #[cfg(all(windows, feature = "vram"))]
+    let mut fixed_repeat_active = vs.source.is_monitor()
+        && fastdesk_fixed_60_fps_enabled()
+        && encoder.input_texture();
+    #[cfg(not(all(windows, feature = "vram")))]
+    let mut fixed_repeat_active = false;
+    if fixed_repeat_active {
+        log::info!("Fastdesk fixed cadence: 1 ms DXGI poll with VRAM-only repeats");
+    }
     let mut fixed_repeat_fail_counter = 0usize;
     let capture_width = c.width;
     let capture_height = c.height;
@@ -729,7 +736,15 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
-        let res = match c.frame(spf) {
+        #[cfg(all(windows, feature = "vram"))]
+        let capture_timeout = if fixed_repeat_active {
+            Duration::from_millis(1)
+        } else {
+            spf
+        };
+        #[cfg(not(all(windows, feature = "vram")))]
+        let capture_timeout = spf;
+        let res = match c.frame(capture_timeout) {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() && (fixed_repeat_active || !frame.is_repeat()) {
@@ -830,7 +845,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         match res {
             Err(ref e) if e.kind() == WouldBlock => {
                 #[cfg(windows)]
-                if try_gdi > 0 && !c.is_gdi() {
+                if !fixed_repeat_active && try_gdi > 0 && !c.is_gdi() {
                     if try_gdi > 3 {
                         c.set_gdi();
                         try_gdi = 0;
