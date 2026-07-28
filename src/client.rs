@@ -132,7 +132,20 @@ pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
 #[cfg(not(target_os = "linux"))]
-pub const AUDIO_BUFFER_MS: usize = 3000;
+const DEFAULT_AUDIO_BUFFER_MS: usize = 500;
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_AUDIO_TARGET_MS: usize = 80;
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_AUDIO_TRIM_MS: usize = 200;
+
+#[cfg(not(target_os = "linux"))]
+fn configured_audio_latency_ms(key: &str, default: usize, min: usize, max: usize) -> usize {
+    Config::get_option(key)
+        .parse::<usize>()
+        .ok()
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1200,18 +1213,19 @@ pub struct AudioHandler {
 struct AudioBuffer(
     pub Arc<std::sync::Mutex<ringbuf::HeapRb<f32>>>,
     usize,
-    [usize; 30],
+    usize,
 );
 
 #[cfg(not(target_os = "linux"))]
 impl Default for AudioBuffer {
     fn default() -> Self {
+        let samples_per_second = 48000 * 2;
         Self(
-            Arc::new(std::sync::Mutex::new(
-                ringbuf::HeapRb::<f32>::new(48000 * 2 * AUDIO_BUFFER_MS / 1000), // 48000hz, 2 channel
-            )),
-            48000 * 2,
-            [0; 30],
+            Arc::new(std::sync::Mutex::new(ringbuf::HeapRb::<f32>::new(
+                samples_per_second * DEFAULT_AUDIO_BUFFER_MS / 1000,
+            ))),
+            samples_per_second * DEFAULT_AUDIO_TARGET_MS / 1000,
+            samples_per_second * DEFAULT_AUDIO_TRIM_MS / 1000,
         )
     }
 }
@@ -1219,80 +1233,64 @@ impl Default for AudioBuffer {
 #[cfg(not(target_os = "linux"))]
 impl AudioBuffer {
     pub fn resize(&mut self, sample_rate: usize, channels: usize) {
-        let capacity = sample_rate * channels * AUDIO_BUFFER_MS / 1000;
+        let max_buffer_ms = configured_audio_latency_ms(
+            "fastdesk-audio-buffer-ms",
+            DEFAULT_AUDIO_BUFFER_MS,
+            200,
+            3000,
+        );
+        let mut target_ms = configured_audio_latency_ms(
+            "fastdesk-audio-target-ms",
+            DEFAULT_AUDIO_TARGET_MS,
+            20,
+            1000,
+        );
+        let mut trim_ms = configured_audio_latency_ms(
+            "fastdesk-audio-trim-ms",
+            DEFAULT_AUDIO_TRIM_MS,
+            40,
+            2000,
+        );
+
+        target_ms = target_ms.min(max_buffer_ms.saturating_sub(20)).max(20);
+        trim_ms = trim_ms.max(target_ms + 20).min(max_buffer_ms);
+
+        let samples_per_second = sample_rate * channels;
+        let capacity = samples_per_second * max_buffer_ms / 1000;
         let old_capacity = self.0.lock().unwrap().capacity();
         if capacity != old_capacity {
             *self.0.lock().unwrap() = ringbuf::HeapRb::<f32>::new(capacity);
-            self.1 = sample_rate * channels;
             log::info!("Audio buffer resized from {old_capacity} to {capacity}");
         }
+        self.1 = samples_per_second * target_ms / 1000;
+        self.2 = samples_per_second * trim_ms / 1000;
+        log::info!(
+            "Fastdesk audio latency: max={}ms, trim={}ms, target={}ms",
+            max_buffer_ms,
+            trim_ms,
+            target_ms
+        );
     }
 
     fn try_shrink(&mut self, having: usize) {
-        extern crate chrono;
-        use chrono::prelude::*;
-
-        let mut i = (having * 10) / self.1;
-        if i > 29 {
-            i = 29;
-        }
-        self.2[i] += 1;
-
-        #[allow(non_upper_case_globals)]
-        static mut tms: i64 = 0;
-        let dt = Local::now().timestamp_millis();
-        unsafe {
-            if tms == 0 {
-                tms = dt;
-                return;
-            } else if dt < tms + 12000 {
-                return;
-            }
-            tms = dt;
-        }
-
-        // the safer water mark to drop
-        let mut zero = 0;
-        // the water mark taking most of time
-        let mut max = 0;
-        for i in 0..30 {
-            if self.2[i] == 0 && zero == i {
-                zero += 1;
-            }
-
-            if self.2[i] > self.2[max] {
-                self.2[max] = 0;
-                max = i;
-            } else {
-                self.2[i] = 0;
-            }
-        }
-        zero = zero * 2 / 3;
-
-        // how many data can be dropped:
-        // 1. will not drop if buffered data is less than 600ms
-        // 2. choose based on min(zero, max)
-        const N: usize = 4;
-        self.2[max] = 0;
-        if max < 6 {
+        if having <= self.2 {
             return;
-        } else if max > zero * N {
-            max = zero * N;
         }
 
         let mut lock = self.0.lock().unwrap();
-        let cap = lock.capacity();
         let having = lock.occupied_len();
-        let skip = (cap * max / (30 * N) + 1) & (!1);
-        if (having > skip * 3) && (skip > 0) {
-            lock.skip(skip);
-            log::info!("skip {skip}, based {max} {zero}");
+        if having > self.2 {
+            // Keep stereo channel alignment while discarding stale audio immediately.
+            let skip = having.saturating_sub(self.1) & (!1);
+            if skip > 0 {
+                lock.skip(skip);
+                log::info!("Fastdesk audio trimmed {skip} stale samples");
+            }
         }
     }
 
-    /// append pcm to audio buffer, if buffered data
-    /// exceeds AUDIO_BUFFER_MS,  only AUDIO_BUFFER_MS
-    /// will be kept.
+    /// Append PCM to the audio buffer. If the hard maximum is exceeded,
+    /// keep the newest audio so latency cannot grow without bound.
     fn append_pcm2(&self, buffer: &[f32]) -> usize {
         let mut lock = self.0.lock().unwrap();
         let cap = lock.capacity();
@@ -1309,9 +1307,7 @@ impl AudioBuffer {
         lock.occupied_len()
     }
 
-    /// append pcm to audio buffer, trying to drop data
-    /// when data is too much (per 12 seconds) based
-    /// statistics.
+    /// Trim accumulated stale audio as soon as the latency threshold is crossed.
     pub fn append_pcm(&mut self, buffer: &[f32]) {
         let having = self.append_pcm2(buffer);
         self.try_shrink(having);
@@ -1487,37 +1483,14 @@ impl AudioHandler {
         let timeout = None;
         let stream = device.build_output_stream(
             config,
-            move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
                 if !*ready.lock().unwrap() {
                     *ready.lock().unwrap() = true;
                 }
 
                 let mut n = data.len();
                 let mut lock = audio_buffer.lock().unwrap();
-                let mut having = lock.occupied_len();
-                // android two timestamps, one from zero, another not
-                #[cfg(not(target_os = "android"))]
-                if having < n {
-                    let tms = info.timestamp();
-                    let how_long = tms
-                        .playback
-                        .duration_since(&tms.callback)
-                        .unwrap_or(Duration::from_millis(0));
-
-                    // must long enough to fight back scheuler delay
-                    if how_long > Duration::from_millis(6) && how_long < Duration::from_millis(3000)
-                    {
-                        drop(lock);
-                        std::thread::sleep(how_long.div_f32(1.2));
-                        lock = audio_buffer.lock().unwrap();
-                        having = lock.occupied_len();
-                    }
-
-                    if having < n {
-                        n = having;
-                    }
-                }
-                #[cfg(target_os = "android")]
+                let having = lock.occupied_len();
                 if having < n {
                     n = having;
                 }
