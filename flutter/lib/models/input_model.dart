@@ -28,6 +28,12 @@ const _kMouseEventDown = 'mousedown';
 const _kMouseEventUp = 'mouseup';
 const _kMouseEventMove = 'mousemove';
 
+bool _isLocalVolumeKey(PhysicalKeyboardKey key) {
+  return key == PhysicalKeyboardKey.audioVolumeUp ||
+      key == PhysicalKeyboardKey.audioVolumeDown ||
+      key == PhysicalKeyboardKey.audioVolumeMute;
+}
+
 class CanvasCoords {
   double x = 0;
   double y = 0;
@@ -736,6 +742,9 @@ class InputModel {
   }
 
   KeyEventResult handleRawKeyEvent(RawKeyEvent e) {
+    if (_isLocalVolumeKey(e.physicalKey)) {
+      return KeyEventResult.ignored;
+    }
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
@@ -821,6 +830,9 @@ class InputModel {
   }
 
   KeyEventResult handleKeyEvent(KeyEvent e) {
+    if (_isLocalVolumeKey(e.physicalKey)) {
+      return KeyEventResult.ignored;
+    }
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {

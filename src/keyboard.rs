@@ -614,8 +614,17 @@ fn start_grab_loop() {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     std::thread::spawn(move || {
         let try_handle_keyboard = move |event: Event, key: Key, is_press: bool| -> Option<Event> {
-            // fix #2211：CAPS LOCK don't work
-            if key == Key::CapsLock || key == Key::NumLock {
+            // Keep local lock and volume controls out of the remote keyboard grab.
+            // Volume keys must continue to control the client PC while a remote
+            // session has focus.
+            if matches!(
+                key,
+                Key::CapsLock
+                    | Key::NumLock
+                    | Key::VolumeUp
+                    | Key::VolumeDown
+                    | Key::VolumeMute
+            ) {
                 return Some(event);
             }
 
